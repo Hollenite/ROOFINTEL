@@ -440,6 +440,27 @@ def _fig_to_base64(fig) -> str:
     return base64.b64encode(buf.read()).decode()
 
 
+def _batch_export_payload(batch_results: dict) -> dict:
+    """Return batch results without heavy UI-only image or geometry payloads."""
+    export_details = {}
+    for filename, detail in batch_results.get("details", {}).items():
+        export_details[filename] = {
+            "warnings": detail.get("warnings", []),
+            "aggregate": detail.get("aggregate", {}),
+            "confidence": detail.get("confidence", {}),
+            "per_roof": detail.get("per_roof", []),
+        }
+
+    return {
+        "summaries": batch_results.get("summaries", []),
+        "aggregate": batch_results.get("aggregate", {}),
+        "details": export_details,
+        "checkpoint": batch_results.get("checkpoint"),
+        "threshold": batch_results.get("threshold"),
+        "location": batch_results.get("location"),
+    }
+
+
 def _format_smart(value: float, unit: str) -> tuple:
     """Auto-scale values for display."""
     if unit == "kW" and value >= 1000:
@@ -782,6 +803,20 @@ if data_mode == "Batch GeoTIFF upload":
                             tariff=tariff,
                             tariff_unit=tariff_unit,
                         )
+                        if summary.status in {"ok", "no_roofs"}:
+                            fig_overlay, ax_overlay = plt.subplots(1, 1, figsize=(6, 6))
+                            overlay_polygons(
+                                tile_image,
+                                detail.get("polygons", []),
+                                ax=ax_overlay,
+                                transform=tile_transform,
+                                title="",
+                            )
+                            detail["preview_images"] = {
+                                "normal": _img_to_base64(tile_image),
+                                "mask": _mask_to_base64(tile_mask),
+                                "overlay": _fig_to_base64(fig_overlay),
+                            }
                     except Exception as exc:
                         summary = BatchTileSummary(
                             filename=uploaded_file.name,
@@ -866,9 +901,105 @@ if data_mode == "Batch GeoTIFF upload":
         summary_df = pd.DataFrame(B["summaries"])
         st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
+        st.markdown(
+            '<div class="section-header"><div class="sh-icon">🛰️</div>Per-Tile Analysis</div>',
+            unsafe_allow_html=True,
+        )
+        for tile_idx, row in enumerate(B["summaries"], start=1):
+            filename = row["filename"]
+            detail = B.get("details", {}).get(filename, {})
+            roof_count = row.get("num_roofs", 0)
+            system_kw = row.get("total_system_kw", 0.0)
+            status = row.get("status", "unknown")
+            expander_label = f"{filename} · {status} · {roof_count} roofs · {system_kw:,.2f} kW"
+
+            with st.expander(expander_label, expanded=(tile_idx == 1)):
+                if status == "error":
+                    st.error(row.get("message", "This tile could not be analyzed."))
+                    warnings_for_tile = detail.get("warnings", [])
+                    if warnings_for_tile:
+                        st.warning("\n".join(f"- {w}" for w in warnings_for_tile))
+                    continue
+
+                if status == "no_roofs":
+                    st.info(row.get("message", "No roof polygons were found for this tile."))
+
+                previews = detail.get("preview_images", {})
+                img_cols = st.columns(3)
+                preview_specs = [
+                    ("Normal", previews.get("normal"), "normal"),
+                    ("AI Mask", previews.get("mask"), "mask"),
+                    ("Overlay", previews.get("overlay"), "overlay"),
+                ]
+                for col, (label, image_b64, suffix) in zip(img_cols, preview_specs):
+                    with col:
+                        if image_b64:
+                            st.markdown(
+                                f"""
+                                <div class="img-card">
+                                    <img src="data:image/png;base64,{image_b64}" alt="{label}" />
+                                    <div class="img-label">{label}</div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                            st.download_button(
+                                f"Download {label}",
+                                data=base64.b64decode(image_b64),
+                                file_name=f"{Path(filename).stem}_{suffix}.png",
+                                mime="image/png",
+                                key=f"batch_{tile_idx}_{suffix}_download",
+                                use_container_width=True,
+                            )
+                        else:
+                            st.info(f"{label} preview unavailable.")
+
+                tile_annual_val, tile_annual_unit = _format_smart(
+                    row.get("total_annual_kwh", 0.0),
+                    "kWh",
+                )
+                st.markdown(f"""
+                <div class="info-grid" style="margin-top: 1rem;">
+                    <div class="info-item">
+                        <div class="info-label">Roof Area</div>
+                        <div class="info-value">{row.get("total_roof_area", 0.0):,.2f} {row.get("total_roof_area_unit", "")}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">System Capacity</div>
+                        <div class="info-value">{row.get("total_system_kw", 0.0):,.2f} kW</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Annual Output</div>
+                        <div class="info-value">{tile_annual_val} {tile_annual_unit}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Confidence</div>
+                        <div class="info-value">{row.get("confidence_score", 0.0):.2f}</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                per_roof_df = pd.DataFrame(detail.get("per_roof", []))
+                if not per_roof_df.empty:
+                    st.markdown("**Roof-Level Estimates**")
+                    st.dataframe(per_roof_df, use_container_width=True, hide_index=True)
+                    roof_csv = io.StringIO()
+                    per_roof_df.to_csv(roof_csv, index=False)
+                    st.download_button(
+                        "Download Roof CSV",
+                        data=roof_csv.getvalue(),
+                        file_name=f"{Path(filename).stem}_roof_estimates.csv",
+                        mime="text/csv",
+                        key=f"batch_{tile_idx}_roof_csv",
+                    )
+
+                warnings_for_tile = detail.get("warnings", [])
+                if warnings_for_tile:
+                    st.warning("\n".join(f"- {w}" for w in warnings_for_tile))
+
         csv_buf = io.StringIO()
         summary_df.to_csv(csv_buf, index=False)
-        batch_json = json.dumps(B, indent=2, default=str)
+        batch_json = json.dumps(_batch_export_payload(B), indent=2, default=str)
 
         col_b1, col_b2 = st.columns(2)
         with col_b1:
