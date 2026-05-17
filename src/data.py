@@ -13,6 +13,8 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import rasterio
+from rasterio.crs import CRS
+from rasterio.errors import NotGeoreferencedWarning
 from rasterio.features import rasterize as rio_rasterize
 from rasterio.transform import from_bounds
 from shapely.geometry import shape as shapely_shape
@@ -31,25 +33,20 @@ except ImportError:
 
 def load_image(
     path: str | Path,
-    default_gsd_m: float = 0.3,
+    gsd_m: float | None = None,
 ) -> Tuple[np.ndarray, rasterio.Affine, Optional[object]]:
     """
     Load a GeoTIFF image.
 
-    If the file has no CRS (common for plain satellite imagery), a default
-    ground-sample-distance (GSD) of *default_gsd_m* metres/pixel is assumed
-    and a projected CRS (EPSG:32643 — UTM 43N, covers Pune/Maharashtra) is
-    assigned so that downstream area calculations are in real square metres
-    instead of pixel².
+    If the file has no CRS, pass an explicit ground-sample-distance (GSD) in
+    metres/pixel so downstream roof areas can be calculated in square metres.
+    Without CRS or GSD, downstream area calculations remain pixel-based.
 
     Returns:
         image  — np.ndarray with shape (bands, H, W)
         transform — rasterio Affine
         crs    — rasterio CRS or None
     """
-    from rasterio.crs import CRS
-    from rasterio.transform import from_bounds
-
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Image not found: {path}")
@@ -59,17 +56,24 @@ def load_image(
         transform = src.transform
         crs = src.crs
 
-    # If no CRS, apply a realistic GSD so areas are in m² not pixel²
-    if crs is None:
+    has_real_scale = crs is not None and not transform.is_identity
+    if not has_real_scale and gsd_m is not None:
         _, h, w = image.shape
-        origin_e, origin_n = 500_000.0, 2_050_000.0  # fake UTM origin
+        origin_e, origin_n = 500_000.0, 2_050_000.0  # synthetic metric origin
         transform = from_bounds(
             origin_e, origin_n,
-            origin_e + w * default_gsd_m,
-            origin_n + h * default_gsd_m,
+            origin_e + w * gsd_m,
+            origin_n + h * gsd_m,
             w, h,
         )
-        crs = CRS.from_epsg(32643)  # UTM 43N (Pune region)
+        crs = CRS.from_epsg(32643)  # projected CRS for metre-based area math
+
+    elif not has_real_scale:
+        warnings.warn(
+            "Image has no usable CRS/geotransform; roof areas will remain pixel-based unless an explicit GSD is supplied.",
+            NotGeoreferencedWarning,
+            stacklevel=2,
+        )
 
     return image, transform, crs
 
@@ -197,6 +201,7 @@ def rasterize_footprints(
 def load_or_create_mask(
     image_path: str | Path,
     label_path: str | Path,
+    gsd_m: float | None = None,
 ) -> Tuple[np.ndarray, rasterio.Affine, Optional[object]]:
     """
     Load image and create a binary mask from labels.
@@ -206,7 +211,7 @@ def load_or_create_mask(
 
     Returns (mask, transform, crs).
     """
-    image, transform, crs = load_image(image_path)
+    image, transform, crs = load_image(image_path, gsd_m=gsd_m)
     h, w = image.shape[1], image.shape[2]
 
     label_path = Path(label_path)

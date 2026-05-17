@@ -571,8 +571,14 @@ use_baseline = st.sidebar.checkbox("Use location yield baseline", value=True)
 st.sidebar.subheader("Solar Assumptions")
 usability = st.sidebar.slider("Roof usability factor", 0.3, 0.9, 0.65)
 panel_density = st.sidebar.slider("Panel power density (kW/m²)", 0.10, 0.25, 0.18)
-perf_ratio = st.sidebar.slider("Performance ratio", 0.60, 0.95, 0.78)
-monthly_gen = st.sidebar.slider("Monthly gen (kWh/kW)", 70.0, 150.0, 110.0)
+perf_ratio = st.sidebar.slider(
+    "Performance ratio", 0.60, 0.95, 0.78,
+    help="Represents system losses. It is not multiplied separately because monthly/annual yield is treated as delivered kWh/kW.",
+)
+monthly_gen = st.sidebar.slider(
+    "Monthly gen (kWh/kW)", 70.0, 150.0, 110.0,
+    help="Delivered generation per installed kW, already including performance-ratio losses.",
+)
 
 config = SolarConfig(
     roof_usability_factor=usability,
@@ -601,6 +607,7 @@ load_policy_overlays = st.sidebar.checkbox("Load policy/market overlays", value=
 
 image = mask = transform = crs = None
 warnings_list: list[str] = []
+explicit_gsd_m: float | None = None
 
 if data_mode == "Synthetic demo":
     seed = st.sidebar.number_input("Random seed", value=42, min_value=0)
@@ -610,6 +617,17 @@ if data_mode == "Synthetic demo":
     )
     warnings_list.append("Using synthetic data — areas computed with 0.3 m/pixel GSD in projected CRS (EPSG:32643).")
 else:
+    st.sidebar.subheader("Area Scale")
+    explicit_gsd_m = st.sidebar.number_input(
+        "Ground sample distance (m/pixel)",
+        min_value=0.01,
+        value=0.30,
+        step=0.01,
+        format="%.2f",
+        help="Required when imagery has no CRS/geotransform. Area formula: roof pixels² × GSD².",
+    )
+    st.sidebar.caption("For non-georeferenced imagery: actual roof area (m²) = detected roof area (pixels²) × GSD².")
+
     st.sidebar.subheader("Data Paths")
     data_dir = Path("data/raw")
     img_dir = data_dir / "images"
@@ -620,14 +638,14 @@ else:
                 "Select tile", available, format_func=lambda p: p.name,
             )
             if selected:
-                image, transform, crs = load_image(selected)
+                image, transform, crs = load_image(selected, gsd_m=explicit_gsd_m)
                 mask_path = data_dir / "masks" / selected.name
                 label_stem = selected.stem
                 label_path = data_dir / "labels" / f"{label_stem}.geojson"
                 if mask_path.exists():
-                    mask, _, _ = load_or_create_mask(selected, mask_path)
+                    mask, _, _ = load_or_create_mask(selected, mask_path, gsd_m=explicit_gsd_m)
                 elif label_path.exists():
-                    mask, _, _ = load_or_create_mask(selected, label_path)
+                    mask, _, _ = load_or_create_mask(selected, label_path, gsd_m=explicit_gsd_m)
         else:
             st.info("No .tif files found in `data/raw/images/`.")
     else:
@@ -639,7 +657,7 @@ else:
         with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
             tmp.write(uploaded.read())
             tmp_path = tmp.name
-        image, transform, crs = load_image(tmp_path)
+        image, transform, crs = load_image(tmp_path, gsd_m=explicit_gsd_m)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1000,7 +1018,7 @@ if "results" in st.session_state:
     tariff_unit = R["tariff_unit"]
     tariff_val = R["tariff"]
 
-    # Average per-resident values
+    # Average per-building values
     avg_savings = total_savings / num_roofs if num_roofs else 0
     avg_net_cost = R["total_net_cost"] / num_roofs if num_roofs else 0
     avg_payback = avg_net_cost / avg_savings if avg_savings > 0 else 0
@@ -1028,7 +1046,7 @@ if "results" in st.session_state:
         <div class="annual-right">
             <div class="icon-circle">💰</div>
             <div>
-                <div class="banner-label">Avg. Money Saved per annum per resident</div>
+                <div class="banner-label">Avg. Money Saved per annum per building</div>
                 <div class="banner-value">₹{avg_sav_str}</div>
                 <div class="banner-sub">Payback: ~{avg_payback:.1f} yrs · Bill reduction: ~{avg_bill_reduction:.0f}% · {num_roofs} buildings</div>
             </div>
@@ -1064,7 +1082,7 @@ if "results" in st.session_state:
         <div class="insight-card">
             <div class="insight-icon icon-green">🌿</div>
             <div class="insight-title">25-Year Lifetime Savings</div>
-            <div class="insight-text">Each household saves avg. ₹{avg_lifetime:,.0f} over system lifetime (25 yrs), with ~{avg_bill_reduction:.0f}% bill reduction.</div>
+            <div class="insight-text">Each detected building saves avg. ₹{avg_lifetime:,.0f} over system lifetime (25 yrs), with ~{avg_bill_reduction:.0f}% bill reduction.</div>
         </div>
         <div class="insight-card">
             <div class="insight-icon icon-amber">⚠️</div>
