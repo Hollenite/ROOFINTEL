@@ -56,6 +56,12 @@ from src.policy import load_policy_records, format_policy_summary, policy_to_dic
 from src.market import load_market_intelligence, format_market_summary, market_to_dict, default_market_record
 from src.confidence import compute_tile_confidence, confidence_to_dict
 from src.feasibility import enrich_polygons_with_feasibility
+from src.infer import load_model, predict_mask
+from src.batch import (
+    BatchTileSummary,
+    aggregate_batch_summaries,
+    analyze_predicted_tile,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -533,6 +539,13 @@ def _load_policies():
 def _load_market():
     return load_market_intelligence()
 
+@st.cache_resource
+def _load_inference_model(checkpoint_path: str):
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model(checkpoint_path, device=device)
+    return model, device
+
 
 baselines = _load_baselines()
 policy_records = _load_policies()
@@ -547,7 +560,7 @@ st.sidebar.header("⚙️ Settings")
 
 data_mode = st.sidebar.radio(
     "Data Mode",
-    ["Synthetic demo", "SpaceNet tile"],
+    ["Synthetic demo", "SpaceNet tile", "Batch GeoTIFF upload"],
     help="Synthetic mode generates fake buildings for a zero-data demo.",
 )
 
@@ -608,6 +621,9 @@ load_policy_overlays = st.sidebar.checkbox("Load policy/market overlays", value=
 image = mask = transform = crs = None
 warnings_list: list[str] = []
 explicit_gsd_m: float | None = None
+batch_uploads = []
+batch_checkpoint_path = Path("checkpoints/best.pth")
+batch_threshold = 0.5
 
 if data_mode == "Synthetic demo":
     seed = st.sidebar.number_input("Random seed", value=42, min_value=0)
@@ -628,36 +644,52 @@ else:
     )
     st.sidebar.caption("For non-georeferenced imagery: actual roof area (m²) = detected roof area (pixels²) × GSD².")
 
-    st.sidebar.subheader("Data Paths")
-    data_dir = Path("data/raw")
-    img_dir = data_dir / "images"
-    if img_dir.exists():
-        available = sorted(img_dir.glob("*.tif"))
-        if available:
-            selected = st.sidebar.selectbox(
-                "Select tile", available, format_func=lambda p: p.name,
-            )
-            if selected:
-                image, transform, crs = load_image(selected, gsd_m=explicit_gsd_m)
-                mask_path = data_dir / "masks" / selected.name
-                label_stem = selected.stem
-                label_path = data_dir / "labels" / f"{label_stem}.geojson"
-                if mask_path.exists():
-                    mask, _, _ = load_or_create_mask(selected, mask_path, gsd_m=explicit_gsd_m)
-                elif label_path.exists():
-                    mask, _, _ = load_or_create_mask(selected, label_path, gsd_m=explicit_gsd_m)
-        else:
-            st.info("No .tif files found in `data/raw/images/`.")
+    if data_mode == "Batch GeoTIFF upload":
+        st.sidebar.subheader("Batch Upload")
+        batch_checkpoint_path = Path(st.sidebar.text_input(
+            "Model checkpoint",
+            value="checkpoints/best.pth",
+            help="Trained U-Net checkpoint used to generate roof masks.",
+        ))
+        batch_threshold = st.sidebar.slider("AI mask threshold", 0.10, 0.90, 0.50, 0.05)
+        batch_uploads = st.sidebar.file_uploader(
+            "Upload GeoTIFF imagery",
+            type=["tif", "tiff"],
+            accept_multiple_files=True,
+            help="Upload pre-tiled company imagery. Best MVP results are 512–1024 px RGB GeoTIFFs.",
+        )
+        st.sidebar.caption("Large rasters are resized to the model input size in this MVP. Pre-tile large AOIs before upload.")
     else:
-        st.info("Create `data/raw/images/` and `data/raw/masks/` directories.")
+        st.sidebar.subheader("Data Paths")
+        data_dir = Path("data/raw")
+        img_dir = data_dir / "images"
+        if img_dir.exists():
+            available = sorted(img_dir.glob("*.tif"))
+            if available:
+                selected = st.sidebar.selectbox(
+                    "Select tile", available, format_func=lambda p: p.name,
+                )
+                if selected:
+                    image, transform, crs = load_image(selected, gsd_m=explicit_gsd_m)
+                    mask_path = data_dir / "masks" / selected.name
+                    label_stem = selected.stem
+                    label_path = data_dir / "labels" / f"{label_stem}.geojson"
+                    if mask_path.exists():
+                        mask, _, _ = load_or_create_mask(selected, mask_path, gsd_m=explicit_gsd_m)
+                    elif label_path.exists():
+                        mask, _, _ = load_or_create_mask(selected, label_path, gsd_m=explicit_gsd_m)
+            else:
+                st.info("No .tif files found in `data/raw/images/`.")
+        else:
+            st.info("Create `data/raw/images/` and `data/raw/masks/` directories.")
 
-    uploaded = st.sidebar.file_uploader("Or upload a GeoTIFF", type=["tif", "tiff"])
-    if uploaded is not None:
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
-            tmp.write(uploaded.read())
-            tmp_path = tmp.name
-        image, transform, crs = load_image(tmp_path, gsd_m=explicit_gsd_m)
+        uploaded = st.sidebar.file_uploader("Or upload a GeoTIFF", type=["tif", "tiff"])
+        if uploaded is not None:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+                tmp.write(uploaded.read())
+                tmp_path = tmp.name
+            image, transform, crs = load_image(tmp_path, gsd_m=explicit_gsd_m)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -679,6 +711,184 @@ st.markdown("""
     </div>
 </div>
 """, unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BATCH PIPELINE — company portfolio screening from uploaded GeoTIFF tiles
+# ═══════════════════════════════════════════════════════════════════════════
+
+if data_mode == "Batch GeoTIFF upload":
+    st.markdown(
+        '<div class="section-header"><div class="sh-icon">📦</div>Batch GeoTIFF Analysis</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Upload pre-tiled GeoTIFF imagery to generate AI roof masks and portfolio-level solar estimates. "
+        "For this MVP, large rasters are resized as one tile; pre-tile large AOIs for better accuracy."
+    )
+
+    run_batch = st.button("🚀 Run Batch Analysis", type="primary", use_container_width=True)
+
+    if run_batch:
+        st.session_state.pop("results", None)
+        if not batch_uploads:
+            st.error("Upload at least one GeoTIFF before running batch analysis.")
+        elif not batch_checkpoint_path.exists():
+            st.error(f"Model checkpoint not found: {batch_checkpoint_path}")
+        else:
+            import tempfile
+
+            _pol = policy_records.get(selected_location_key)
+            tariff = _pol.example_tariff_residential_per_kwh if (_pol and _pol.example_tariff_residential_per_kwh) else 0.10
+            tariff_unit = _pol.example_tariff_unit if _pol else "USD"
+
+            summaries = []
+            details = {}
+            progress = st.progress(0)
+            status_box = st.empty()
+
+            with st.spinner("Loading trained roof detection model..."):
+                model, device = _load_inference_model(str(batch_checkpoint_path))
+
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_dir_path = Path(tmp_dir)
+                total_files = len(batch_uploads)
+                for idx, uploaded_file in enumerate(batch_uploads, start=1):
+                    status_box.info(f"Analyzing {uploaded_file.name} ({idx}/{total_files})...")
+                    suffix = Path(uploaded_file.name).suffix or ".tif"
+                    tmp_path = tmp_dir_path / f"tile_{idx}{suffix}"
+                    tmp_path.write_bytes(uploaded_file.getbuffer())
+
+                    try:
+                        tile_image, tile_transform, tile_crs = load_image(
+                            tmp_path,
+                            gsd_m=explicit_gsd_m,
+                        )
+                        tile_mask = predict_mask(
+                            model,
+                            tile_image,
+                            device=device,
+                            threshold=batch_threshold,
+                        )
+                        summary, detail = analyze_predicted_tile(
+                            filename=uploaded_file.name,
+                            image=tile_image,
+                            mask=tile_mask,
+                            transform=tile_transform,
+                            crs=tile_crs,
+                            config=config,
+                            min_area=min_area,
+                            simplify_tolerance=simplify_tol,
+                            tariff=tariff,
+                            tariff_unit=tariff_unit,
+                        )
+                    except Exception as exc:
+                        summary = BatchTileSummary(
+                            filename=uploaded_file.name,
+                            status="error",
+                            message=str(exc),
+                            tariff=tariff,
+                            tariff_unit=tariff_unit,
+                        )
+                        detail = {"warnings": [str(exc)]}
+
+                    summaries.append(summary)
+                    details[uploaded_file.name] = detail
+                    progress.progress(idx / total_files)
+
+            status_box.success("Batch analysis complete.")
+            st.session_state["batch_results"] = {
+                "summaries": [s.to_dict() for s in summaries],
+                "aggregate": aggregate_batch_summaries(summaries),
+                "details": details,
+                "checkpoint": str(batch_checkpoint_path),
+                "threshold": batch_threshold,
+                "location": selected_location_display,
+            }
+
+    if "batch_results" in st.session_state:
+        B = st.session_state["batch_results"]
+        agg = B["aggregate"]
+        annual_val, annual_unit = _format_smart(agg["total_annual_kwh"], "kWh")
+        cap_val, cap_unit = _format_smart(agg["total_system_kw"], "kW")
+        savings_val = agg["estimated_annual_saving"]
+
+        st.markdown(f"""
+        <div class="metric-grid">
+            <div class="metric-card">
+                <div class="icon-box icon-blue">📁</div>
+                <div class="value">{agg["successful_files"]}/{agg["files_analyzed"]}</div>
+                <div class="label">Files Analyzed</div>
+                <div class="sublabel">{agg["failed_files"]} failed or empty</div>
+            </div>
+            <div class="metric-card">
+                <div class="icon-box icon-indigo">🏢</div>
+                <div class="value">{agg["total_roofs"]}</div>
+                <div class="label">Detected Rooftops</div>
+                <div class="sublabel">portfolio total</div>
+            </div>
+            <div class="metric-card">
+                <div class="icon-box icon-amber">⚡</div>
+                <div class="value">{cap_val} {cap_unit}</div>
+                <div class="label">System Capacity</div>
+                <div class="sublabel">estimated total</div>
+            </div>
+            <div class="metric-card">
+                <div class="icon-box icon-green">📊</div>
+                <div class="value">{annual_val} {annual_unit}</div>
+                <div class="label">Annual Output</div>
+                <div class="sublabel">estimated generation</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div class="annual-split">
+            <div class="annual-left">
+                <div class="icon-circle">📦</div>
+                <div>
+                    <div class="banner-label">Batch Portfolio</div>
+                    <div class="banner-value">{agg["files_analyzed"]} Tiles</div>
+                    <div class="banner-sub">Checkpoint: {B["checkpoint"]} · Threshold: {B["threshold"]:.2f}</div>
+                </div>
+            </div>
+            <div class="annual-right">
+                <div class="icon-circle">💰</div>
+                <div>
+                    <div class="banner-label">Estimated Annual Savings</div>
+                    <div class="banner-value">₹{savings_val:,.0f}</div>
+                    <div class="banner-sub">Simple tariff-based estimate for {B["location"]}</div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        summary_df = pd.DataFrame(B["summaries"])
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+        csv_buf = io.StringIO()
+        summary_df.to_csv(csv_buf, index=False)
+        batch_json = json.dumps(B, indent=2, default=str)
+
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            st.download_button(
+                "📊 Download Batch CSV",
+                data=csv_buf.getvalue(),
+                file_name="batch_summary.csv",
+                mime="text/csv",
+            )
+        with col_b2:
+            st.download_button(
+                "📋 Download Batch JSON",
+                data=batch_json,
+                file_name="batch_summary.json",
+                mime="application/json",
+            )
+    else:
+        st.info("Upload GeoTIFF tiles from the sidebar, then run batch analysis.")
+
+    st.stop()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
